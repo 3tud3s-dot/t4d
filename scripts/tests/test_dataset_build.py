@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 import urllib.error
@@ -164,6 +165,147 @@ class DownloadTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.loader = d.Downloader(self.root, self.root / "ledger.json", self.root / "download.log", {"proxy": None, "attempts": 3})
+
+    def batch_loader(self, concurrent=2):
+        return d.Downloader(self.root, self.root / "batch-ledger.json", self.root / "batch-download.log",
+                            {"endpoint": c.MIRROR_ENDPOINT, "proxy": None, "attempts": 1,
+                             "concurrent_files": concurrent})
+
+    def test_batch_parallel_limit_and_atomic_ownership_journal(self):
+        loader = self.batch_loader()
+        records = [record(f"raw/s/file_{i}.npy", lfs=True) for i in range(8)]
+        barrier = threading.Barrier(2)
+        guard = threading.Lock()
+        active = peak = 0
+        def transfer(args, **kwargs):
+            nonlocal active, peak
+            name = next(a[6:] for a in args if a.startswith("--out="))
+            directory = Path(next(a[6:] for a in args if a.startswith("--dir=")))
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            # Ownership must be durably recorded before each transfer starts.
+            with loader._journal_lock:
+                journal = json.loads(loader.journal_path.read_text())
+            self.assertTrue(journal['raw/s/' + name]['owned'])
+            barrier.wait(timeout=5)
+            (directory / name).write_bytes(b'test')
+            with guard:
+                active -= 1
+            return SimpleNamespace(returncode=0)
+        with patch.object(d.subprocess, 'run', side_effect=transfer) as transfer_mock:
+            result = loader.fetch_many(records)
+        self.assertEqual(peak, 2)
+        self.assertEqual(transfer_mock.call_count, 8)
+        self.assertEqual(result, [self.root / r['path'] for r in records])
+        journal = json.loads(loader.journal_path.read_text())
+        self.assertEqual(len(journal), 8)
+        self.assertTrue(all(v['status']=='verified' for v in journal.values()))
+
+    def test_batch_failure_joins_active_transfer_and_stops_new_work(self):
+        loader = self.batch_loader()
+        records = [record(f'raw/s/{i}.npy') for i in range(4)]
+        active = threading.Event()
+        failed = threading.Event()
+        release = threading.Event()
+        errors = []
+        started = []
+        def transfer(rec):
+            started.append(rec['path'])
+            if rec == records[0]:
+                self.assertTrue(active.wait(5))
+                failed.set()
+                raise RuntimeError('injected network error')
+            self.assertEqual(rec, records[1])
+            active.set()
+            self.assertTrue(release.wait(5))
+            return self.root / rec['path']
+        def batch():
+            try:
+                loader.fetch_many(records)
+            except Exception as exc:
+                errors.append(exc)
+        with patch.object(loader, '_fetch', side_effect=transfer):
+            worker = threading.Thread(target=batch)
+            worker.start()
+            try:
+                self.assertTrue(failed.wait(5))
+                self.assertTrue(worker.is_alive())
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(set(started), {r['path'] for r in records[:2]})
+
+    def test_batch_deduplicates_identical_paths_and_rejects_conflict_before_transfer(self):
+        loader = self.batch_loader()
+        rec = record()
+        with patch.object(loader, '_fetch', return_value=self.root / rec['path']) as fetch:
+            self.assertEqual(len(loader.fetch_many([rec, deepcopy(rec)])), 1)
+            fetch.assert_called_once_with(rec)
+        other = {**rec, 'size': rec['size'] + 1}
+        with patch.object(loader, '_fetch') as fetch:
+            with self.assertRaisesRegex(ValueError, 'Conflicting'):
+                loader.fetch_many([rec, other])
+            fetch.assert_not_called()
+        self.assertEqual(loader.fetch_many([]), [])
+
+    def test_batch_single_worker_preserves_original_file_order(self):
+        loader = self.batch_loader(1)
+        records = [record(f'raw/s/{i}.npy', b'x'*i) for i in [1, 3, 2]]
+        with patch.object(loader, '_fetch', side_effect=lambda r:self.root/r['path']) as fetch:
+            loader.fetch_many(records)
+        self.assertEqual([call.args[0] for call in fetch.call_args_list], records)
+
+    def test_batch_resume_verified_files_never_redownloads(self):
+        loader = self.batch_loader()
+        records = [record(f'raw/s/{i}.npy') for i in range(3)]
+        def transfer(args, **kwargs):
+            directory=Path(next(a[6:] for a in args if a.startswith('--dir=')))
+            name=next(a[6:] for a in args if a.startswith('--out='))
+            (directory/name).write_bytes(b'test')
+            return SimpleNamespace(returncode=0)
+        with patch.object(d.subprocess, 'run', side_effect=transfer):
+            loader.fetch_many(records)
+        resumed=self.batch_loader()
+        with patch.object(d.subprocess, 'run') as transfer_mock:
+            resumed.fetch_many(records)
+        transfer_mock.assert_not_called()
+        self.assertTrue(all(v['owned'] for v in resumed.journal.values()))
+
+    def test_batch_corrupt_file_retained_and_never_marked_verified(self):
+        loader=self.batch_loader()
+        rec=record(lfs=True)
+        def transfer(args, **kwargs):
+            (self.root/rec['path']).write_bytes(b'bad!')
+            return SimpleNamespace(returncode=0)
+        with patch.object(d.subprocess, 'run', side_effect=transfer):
+            with self.assertRaisesRegex(ValueError, 'identity mismatch'):
+                loader.fetch_many([rec])
+        self.assertEqual(loader.journal[rec['path']]['status'], 'downloading')
+        self.assertTrue((self.root/rec['path']).exists())
+
+    def test_batch_preexisting_files_still_not_owned_or_deleted(self):
+        loader=self.batch_loader()
+        records=[record(f'raw/s/{i}.npy') for i in range(3)]
+        for rec in records:
+            path=self.root/rec['path']; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'test')
+        with patch.object(d.subprocess,'run') as transfer_mock:
+            loader.fetch_many(records)
+        transfer_mock.assert_not_called()
+        loader.cleanup(records,validation_passed=True)
+        self.assertTrue(all((self.root/r['path']).exists() for r in records))
+
+    def test_invalid_concurrency_rejected_by_downloader_and_config(self):
+        for value in [0, 9, True, 2.5, '4']:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.batch_loader(value)
+            config=json.loads((p.HERE/'build_config.json').read_text())
+            config['download']['concurrent_files']=value
+            file=self.root/'config.json'; file.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError,'Concurrent'):
+                p.load_config(file)
 
     def test_sha_and_git_blob_checked(self):
         path = self.root / "a"
@@ -385,9 +527,9 @@ class PipelineTests(unittest.TestCase):
                     patch.object(p, "Downloader", return_value=loader), patch.object(p, "available_bytes", return_value=10**15), \
                     patch.object(p, "run_command", side_effect=command) as commands:
                 self.assertEqual(p.execute_locked(config, roots, run), 0)
-                loader.fetch.assert_called_once_with(rec)
+                loader.fetch_many.assert_called_once_with([rec])
                 self.assertEqual(p.execute_locked(config, roots, run), 0)
-                loader.fetch.assert_called_once_with(rec)
+                loader.fetch_many.assert_called_once_with([rec])
                 self.assertIn("--structure-only", commands.call_args[0][0])
             state = json.loads((run / "state.json").read_text())
             self.assertEqual(state["status"], "completed")
@@ -452,7 +594,7 @@ class PipelineTests(unittest.TestCase):
             calls = []
             class FakeLoader:
                 def missing_bytes(self, records):return 4
-                def fetch(self, rec):calls.append("download")
+                def fetch_many(self, records):calls.append("download")
                 def cleanup(self, records, validation_passed):
                     self_test.assertTrue(validation_passed)
                     self_test.assertIn("full_validate", calls)
@@ -499,7 +641,7 @@ class PipelineTests(unittest.TestCase):
             with patch.object(p, "available_bytes", return_value=10**15), patch.object(p, "run_command") as command:
                 p.process_episode("new", {"episode": 7, "download_ready": True, "files": [record()]}, [], loader,
                                   roots, root, config, state, root / "rules", {})
-            loader.fetch.assert_called_once()
+            loader.fetch_many.assert_called_once_with([record()])
             loader.cleanup.assert_not_called()
             command.assert_not_called()
             self.assertEqual(state["episodes"]["new/episode_7"]["status"], "needs_rules")

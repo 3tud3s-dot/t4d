@@ -66,8 +66,12 @@ def load_config(path, project=PROJECT):
                 or len(episodes) != len(set(episodes))):
             raise ValueError("Select distinct nonnegative Episode IDs")
     d, s = config["download"], config["space"]
-    if set(d) not in ({"proxy", "attempts"}, {"endpoint", "proxy", "attempts"}) or type(d["attempts"]) is not int or not 1 <= d["attempts"] <= 10:
+    if (not {"proxy", "attempts"} <= d.keys()
+            or d.keys() - {"endpoint", "proxy", "attempts", "concurrent_files"}
+            or type(d["attempts"]) is not int or not 1 <= d["attempts"] <= 10):
         raise ValueError("Invalid bounded download retry configuration")
+    if type(d.get("concurrent_files", 1)) is not int or not 1 <= d.get("concurrent_files", 1) <= 8:
+        raise ValueError("Concurrent files must be an integer between 1 and 8")
     normalize_endpoint(d.get("endpoint", OFFICIAL_ENDPOINT))
     if d["proxy"] is not None and not isinstance(d["proxy"], str):
         raise ValueError("Invalid proxy")
@@ -180,8 +184,7 @@ def process_episode(scene, entry, shared, downloader, roots, run, config, state,
                 int(splat_bytes * space["output_to_splat_tar_multiplier"]), int(space["reserve_gib"] * 2**30))
     item.update(status="downloading", reason=None)
     save_json(run / "state.json", state)
-    for record in shared + records:
-        downloader.fetch(record)
+    downloader.fetch_many(shared + records)
     item["status"] = "downloaded"
     save_json(run / "state.json", state)
     if entry["episode"] not in supported.get(scene, {}):
