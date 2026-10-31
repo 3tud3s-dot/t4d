@@ -19,12 +19,13 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 
 try:
-    from .catalog import Hub, REPOS, OFFICIAL_ENDPOINT, normalize_endpoint, build_catalog, safe_name, save_json
+    from .catalog import Hub, REPOS, OFFICIAL_ENDPOINT, normalize_endpoint, build_catalog, safe_name, save_json, parse_scene_ids
     from .download import Downloader, SpaceBlocked, bounded_path, check_space, available_bytes
 except ImportError:
-    from catalog import Hub, REPOS, OFFICIAL_ENDPOINT, normalize_endpoint, build_catalog, safe_name, save_json
+    from catalog import Hub, REPOS, OFFICIAL_ENDPOINT, normalize_endpoint, build_catalog, safe_name, save_json, parse_scene_ids
     from download import Downloader, SpaceBlocked, bounded_path, check_space, available_bytes
 
 PROJECT = Path(__file__).resolve().parents[2]
@@ -44,24 +45,33 @@ def load_config(path, project=PROJECT):
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     expected = {"schema", "source_root", "output_root", "runs_root", "scenes", "download", "space",
                 "cleanup_verified_sources", "scene_rules"}
-    if set(config) not in (expected, expected | {"episodes"}) or config["schema"] != SCHEMA:
+    keys = set(config)
+    if "scene_ids" in config:
+        expected = expected - {"scenes"} | {"scene_ids"}
+    if keys not in (expected, expected | {"episodes"}) or config["schema"] != SCHEMA:
         raise ValueError("Invalid build configuration schema")
     roots = {k: bounded_path(project, config[k]) for k in ("source_root", "output_root", "runs_root")}
     for key, root in roots.items():
         for other_key, other in roots.items():
             if key != other_key and (root.is_relative_to(other) or other.is_relative_to(root)):
                 raise ValueError("Source, output and run directories must be separate")
-    if not isinstance(config["scenes"], list) or len(config["scenes"]) != len(set(config["scenes"])):
+    if "scene_ids" in config:
+        parse_scene_ids(config["scene_ids"])
+    scenes = config.get("scenes", [])
+    if not isinstance(scenes, list) or len(scenes) != len(set(scenes)):
         raise ValueError("Scene list must be unique")
-    for scene in config["scenes"]:
+    for scene in scenes:
         safe_name(scene)
     selections = config.get("episodes", {})
     if not isinstance(selections, dict):
         raise ValueError("Episode selections must be a dictionary")
     for scene, episodes in selections.items():
         safe_name(scene)
-        if config["scenes"] and scene not in config["scenes"]:
+        if scenes and scene not in scenes:
             raise ValueError("Episode selection references an unselected scene")
+        if "scene_ids" in config and (not re.match(r"^\d{3}-", scene)
+                or int(scene[:3]) not in parse_scene_ids(config["scene_ids"])):
+            raise ValueError("Episode selection references an unselected scene ID")
         if (not isinstance(episodes, list) or not episodes or any(type(n) is not int or n < 0 for n in episodes)
                 or len(episodes) != len(set(episodes))):
             raise ValueError("Select distinct nonnegative Episode IDs")
@@ -95,6 +105,8 @@ def select_episodes(catalog, selections):
         if scene not in scenes:
             raise ValueError("Selected scene absent from pinned catalog")
         available = {e["episode"] for e in scenes[scene]["episodes"]}
+        if scenes[scene].get("audit_status") == "request_failed":
+            continue  # The episode list is unknown, not proven absent.
         if set(episodes) - available:
             raise ValueError(f"Requested Episode absent from pinned catalog: {scene}")
         scenes[scene]["episodes"] = [e for e in scenes[scene]["episodes"] if e["episode"] in episodes]
@@ -154,13 +166,49 @@ def converter_command(scene, episode, roots, rules, *, validate=False, structure
     return command
 
 
+def prepare_episode_rules(scene, episode, roots, run, configured_path, shared):
+    try:
+        from . import rebuild
+    except ImportError:
+        import rebuild
+    configured = json.loads(Path(configured_path).read_text(encoding="utf-8"))
+    medians = {stream: [Path(r["path"]).name for r in shared
+                       if r["path"].startswith(f"raw/{scene}/brics-odroid_{stream}/")
+                       and re.fullmatch(r"median_\d+\.npy", Path(r["path"]).name)]
+               for stream in rebuild.STREAMS}
+    effective, audit = rebuild.resolve_episode_rules(roots["source_root"], scene, episode, configured,
+                                                    available_medians=medians)
+    path = bounded_path(run, f"checks/{safe_name(scene)}-episode_{episode}-rules.json")
+    path.parent.mkdir(exist_ok=True)
+    if path.exists():
+        if json.loads(path.read_text(encoding="utf-8")) != effective:
+            raise ValueError("Previously resolved Episode rules changed; preserving existing evidence")
+    else:
+        save_json(path, effective)
+    return path, audit
+
+
 def process_episode(scene, entry, shared, downloader, roots, run, config, state, rules, supported, approved_medians=None):
+    try:
+        from . import rebuild
+    except ImportError:
+        import rebuild
     key = f"{scene}/episode_{entry['episode']}"
     item = state["episodes"].setdefault(key, {"status": "pending"})
     log = run / "logs" / f"{scene}-episode_{entry['episode']}.log"
     target = bounded_path(roots["output_root"], key)
     records = entry["files"]
+    if item["status"] in ("rejected_local", "rejected_cleaned"):
+        if item["status"] == "rejected_local" and config["cleanup_verified_sources"]:
+            downloader.discard(records, reason=item["reason"])
+            item["status"] = "rejected_cleaned"
+            save_json(run / "state.json", state)
+        return
     if item["status"] in ("verified", "cleaned"):
+        if "rules_file" in item:
+            rules = bounded_path(run, item["rules_file"])
+            if digest(rules) != item["rules_sha256"]:
+                raise ValueError("Resolved Episode rules changed after validation")
         if digest(target / "metadata.json") != item["metadata_sha256"]:
             raise ValueError("Published V1 metadata changed after successful validation")
         run_command(converter_command(scene, entry["episode"], roots, rules, validate=True, structure_only=True), log)
@@ -169,32 +217,51 @@ def process_episode(scene, entry, shared, downloader, roots, run, config, state,
             item["status"] = "cleaned"
             save_json(run / "state.json", state)
         return
+    if entry.get("audit_status") == "request_failed":
+        item.update(status="network_audit_failed", reason=entry.get("request_errors", []))
+        save_json(run / "state.json", state)
+        return
     if not entry["download_ready"]:
         item.update(status="unavailable_sources", reason=entry["reasons"])
         save_json(run / "state.json", state)
         return
     space = config["space"]
     splat_bytes = sum(f["size"] for f in records if f["path"].endswith("/splatfacto.tar"))
+    small = [r for r in records if r["path"].endswith(("/metadata.json", "/robot/robot.npy"))]
+    # Ambiguous identity need not retain huge GS/camera archives: inspect the
+    # pinned metadata/robot payloads first, without classifying the scene as bad.
+    check_space(available_bytes(roots["source_root"], space["quota_limit_gib"]),
+                downloader.missing_bytes(small), 0, int(space["reserve_gib"] * 2**30))
+    item.update(status="checking_inputs", reason=None)
+    save_json(run / "state.json", state)
+    for record in small:
+        downloader.fetch(record)
+    try:
+        rules, local_audit = prepare_episode_rules(scene, entry["episode"], roots, run, rules, shared)
+    except rebuild.RulesPending as exc:
+        item.update(status="needs_rules", reason=str(exc))
+        save_json(run / "state.json", state)
+        return
+    except rebuild.DataRejected as exc:
+        item.update(status="rejected_local", reason=str(exc))
+        save_json(run / "state.json", state)  # Rejection evidence precedes deletion.
+        if config["cleanup_verified_sources"]:
+            downloader.discard(records, reason=str(exc))
+            item["status"] = "rejected_cleaned"
+            save_json(run / "state.json", state)
+        return
+    item.update(rules_file=rules.relative_to(run).as_posix(), rules_sha256=digest(rules), local_audit=local_audit)
     check_space(available_bytes(roots["source_root"], space["quota_limit_gib"]),
                 downloader.missing_bytes(shared + records),
                 int(splat_bytes * space["output_to_splat_tar_multiplier"]), int(space["reserve_gib"] * 2**30))
-    item.update(status="downloading", reason=None)
+    item["status"] = "downloading"
     save_json(run / "state.json", state)
+    small_paths = {r["path"] for r in small}
     for record in shared + records:
-        downloader.fetch(record)
+        if record["path"] not in small_paths:
+            downloader.fetch(record)
     item["status"] = "downloaded"
     save_json(run / "state.json", state)
-    if entry["episode"] not in supported.get(scene, {}):
-        item.update(status="needs_rules", reason="Explicit physical-hand bindings and evidence required")
-        save_json(run / "state.json", state)
-        return
-    if approved_medians is not None and scene not in approved_medians:
-        for sensor in ("tactilel_left", "tactilel_right", "tactiler_left", "tactiler_right"):
-            directory = bounded_path(roots["source_root"], f"raw/{scene}/brics-odroid_{sensor}")
-            if len(list(directory.glob("median_*.npy"))) > 1:
-                item.update(status="needs_rules", reason="Downloaded multiple baselines; explicit choice required")
-                save_json(run / "state.json", state)
-                return
     # An existing uncommitted/partial output is never overwritten automatically.
     if target.exists():
         item.update(status="validating_existing")
@@ -250,7 +317,11 @@ def execute_locked(config, roots, run):
     for folder in ("logs", "checks", "catalog_cache"):
         (run / folder).mkdir(exist_ok=True)
     rules = run / "scene_rules.json"
-    save_json(rules, config["scene_rules"])
+    if rules.exists():
+        if json.loads(rules.read_text(encoding="utf-8")) != config["scene_rules"]:
+            raise ValueError("Configured scene-rule snapshot changed")
+    else:
+        save_json(rules, config["scene_rules"])
     # These are precisely the same mapping tables used by both child CLIs.
     try:
         from . import rebuild
@@ -263,29 +334,62 @@ def execute_locked(config, roots, run):
     if pins.exists():
         revisions = json.loads(pins.read_text(encoding="utf-8"))
     else:
-        revisions = {k: hub.pin(repo) for k, repo in REPOS.items()}
+        try:
+            revisions = {k: hub.pin(repo) for k, repo in REPOS.items()}
+        except (OSError, urllib.error.URLError) as exc:
+            previous = json.loads((run / "state.json").read_text()) if (run / "state.json").exists() else {"episodes": {}}
+            previous.update(status="network_audit_failed", reason=type(exc).__name__ + ": " + str(exc))
+            save_json(run / "state.json", previous)
+            raise
         save_json(pins, revisions)
-    manifest = run / "manifest.json"
+    provenance_path = run / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8")) if provenance_path.exists() else None
+    manifest = bounded_path(run, provenance.get("manifest_file", "manifest.json")) if provenance else run / "manifest.json"
+    if provenance and (not manifest.exists() or provenance["manifest_sha256"] != digest(manifest)):
+        raise ValueError("Pinned manifest changed")
     if manifest.exists():
         catalog = json.loads(manifest.read_text(encoding="utf-8"))
     else:
-        catalog = select_episodes(build_catalog(hub, revisions, config["scenes"], run / "catalog_cache"),
-                                  config.get("episodes", {}))
+        catalog = None
+    refresh = catalog is not None and any(s.get("audit_status") == "request_failed" for s in catalog["scenes"])
+    if catalog is None or refresh:
+        if refresh:
+            # Immutable generations plus one atomic provenance pointer. A crash
+            # never replaces a published successful manifest with half a write.
+            number = 2
+            while (run / f"manifest-{number:04d}.json").exists():
+                number += 1
+            manifest = run / f"manifest-{number:04d}.json"
+        try:
+            kwargs = {"scene_ids": config["scene_ids"]} if "scene_ids" in config else {}
+            catalog = select_episodes(build_catalog(hub, revisions, config.get("scenes", []),
+                                                    run / "catalog_cache", **kwargs), config.get("episodes", {}))
+        except (OSError, urllib.error.URLError) as exc:
+            previous = json.loads((run / "state.json").read_text()) if (run / "state.json").exists() else {"episodes": {}}
+            previous.update(status="network_audit_failed", reason=type(exc).__name__ + ": " + str(exc))
+            save_json(run / "state.json", previous)
+            raise
         save_json(manifest, catalog)
     if catalog["revisions"] != revisions:
         raise ValueError("Manifest revision mismatch")
-    provenance_path = run / "provenance.json"
-    if not provenance_path.exists():
-        save_json(provenance_path, {"code_sha256": identity, "manifest_sha256": digest(manifest),
+    if provenance is None:
+        provenance = {"code_sha256": identity, "manifest_sha256": digest(manifest),
+                  "manifest_file": manifest.name,
                   "source_commit": os.environ.get("T4D_SOURCE_SHA"),
                   "network": hub.network_info,
                   "config_sha256": digest(snapshot), "python": sys.version,
                   "slurm_job_id": os.environ.get("SLURM_JOB_ID"), "slurm_step_id": os.environ.get("SLURM_STEP_ID"),
-                  "started_utc": datetime.now(timezone.utc).isoformat()})
-    else:
-        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-        if provenance["manifest_sha256"] != digest(manifest):
-            raise ValueError("Pinned manifest changed")
+                  "started_utc": datetime.now(timezone.utc).isoformat()}
+    elif refresh:
+        provenance.setdefault("audit_history", []).append({"manifest_file": provenance.get("manifest_file", "manifest.json"),
+                                                          "sha256": provenance["manifest_sha256"]})
+        provenance.update(manifest_file=manifest.name, manifest_sha256=digest(manifest))
+    save_json(provenance_path, provenance)
+    save_json(run / "network_audit.json", {
+        "revisions": revisions, "selection_errors": catalog.get("selection_errors", []),
+        "scenes": [{k: s.get(k) for k in ("scene", "audit_status", "request_errors", "reasons", "streams")}
+                   | {"episodes": [{k: e.get(k) for k in ("episode", "audit_status", "reasons", "request_errors")}
+                                    for e in s["episodes"]]} for s in catalog["scenes"]]})
     state_path = run / "state.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {"episodes": {}, "attempts": []}
     state["attempts"].append({"job_id": os.environ.get("SLURM_JOB_ID"), "started_utc": datetime.now(timezone.utc).isoformat()})
@@ -293,7 +397,14 @@ def execute_locked(config, roots, run):
     save_json(state_path, state)
     downloader = Downloader(roots["source_root"], run / "source_ledger.json", run / "logs" / "download.log", config["download"])
     blocked = False
+    state.setdefault("scene_status", {})
+    state.setdefault("completed_scenes", [])
     for scene in catalog["scenes"]:
+        if scene.get("audit_status") == "request_failed":
+            state["scene_status"][scene["scene"]] = {"status": "network_audit_failed", "reason": scene.get("request_errors", [])}
+            save_json(state_path, state)
+            blocked = True
+            continue
         for entry in scene["episodes"]:
             key = f"{scene['scene']}/episode_{entry['episode']}"
             if code_identity() != identity:
@@ -313,15 +424,29 @@ def execute_locked(config, roots, run):
                 blocked = True
             status = state["episodes"][key]["status"]
             print(f"{key}: {status}", flush=True)
-            blocked |= status not in ("verified", "cleaned", "unavailable_sources")
+            blocked |= status not in ("verified", "cleaned", "unavailable_sources", "rejected_local", "rejected_cleaned")
         keys = [f"{scene['scene']}/episode_{e['episode']}" for e in scene["episodes"]]
-        if keys and all(state["episodes"].get(k, {}).get("status") in ("verified", "cleaned") for k in keys):
+        statuses = [state["episodes"].get(k, {}).get("status") for k in keys]
+        successful = bool(keys) and all(s in ("verified", "cleaned") for s in statuses)
+        terminal = bool(keys) and all(s in ("verified", "cleaned", "unavailable_sources", "rejected_local", "rejected_cleaned") for s in statuses)
+        if terminal:
             if config["cleanup_verified_sources"]:
-                downloader.cleanup(scene["raw_files"], validation_passed=True)
+                if any(s in ("verified", "cleaned") for s in statuses):
+                    downloader.cleanup(scene["raw_files"], validation_passed=True)
+                else:
+                    downloader.discard(scene["raw_files"], reason="All selected Episodes were unavailable or explicitly rejected")
+        state["scene_status"][scene["scene"]] = {"status": "completed" if successful else "needs_attention" if not terminal and keys else "completed_with_exclusions",
+                                                "episodes": len(keys), "validated": sum(s in ("verified", "cleaned") for s in statuses)}
+        if successful and scene["scene"] not in state["completed_scenes"]:
+            state["completed_scenes"].append(scene["scene"])
+            print(f"SCENE_COMPLETE {scene['scene']} completed_scenes={len(state['completed_scenes'])}", flush=True)
+        save_json(state_path, state)
     from collections import Counter
     state["summary"] = dict(Counter(v["status"] for v in state["episodes"].values()))
     state["scenes_without_processed_episodes"] = [s["scene"] for s in catalog["scenes"] if not s["episodes"]]
-    excluded = bool(state["summary"].get("unavailable_sources") or state["scenes_without_processed_episodes"])
+    excluded = bool(state["summary"].get("unavailable_sources") or state["summary"].get("rejected_local")
+                    or state["summary"].get("rejected_cleaned") or state["scenes_without_processed_episodes"]
+                    or catalog.get("selection_errors"))
     state["status"] = "needs_attention" if blocked else ("completed_with_exclusions" if excluded else "completed")
     state["finished_utc"] = datetime.now(timezone.utc).isoformat()
     save_json(state_path, state)
@@ -339,7 +464,8 @@ def main(argv=None):
         config, roots = load_config(args.config)
         if not args.execute:
             print(json.dumps({"mode": "plan_only", "run": str(roots["runs_root"] / args.run_id),
-                              "paths": {k: str(v) for k, v in roots.items()}, "scenes": config["scenes"] or "all published scenes",
+                              "paths": {k: str(v) for k, v in roots.items()}, "scenes": config.get("scenes", []),
+                              "scene_ids": parse_scene_ids(config["scene_ids"]) if "scene_ids" in config else None,
                               "explicit_episode_selection": config.get("episodes", {}),
                               "endpoint": config["download"].get("endpoint", OFFICIAL_ENDPOINT),
                               "proxy_mode": "direct" if config["download"]["proxy"] is None else "explicit_proxy",

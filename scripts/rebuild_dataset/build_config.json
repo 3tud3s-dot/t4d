@@ -3,7 +3,7 @@
   "source_root": "datasets/deform360",
   "output_root": "datasets/touch4d-v1",
   "runs_root": "runs/dataset_build",
-  "scenes": [],
+  "scene_ids": "001-020",
   "download": {
     "endpoint": "https://hf-mirror.com",
     "proxy": null,

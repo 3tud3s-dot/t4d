@@ -10,10 +10,14 @@ set -euo pipefail
 : "${SOURCE_ROOT:?Set SOURCE_ROOT to the t4d project directory}"
 : "${PYTHON:?Set PYTHON to an existing Python >=3.10 environment}"
 : "${RUN_ID:?Set a unique RUN_ID; reuse only to resume that run}"
+# The same run ID/config/source resumes its journal; completed Episodes are
+# checked without downloading them again. Scene milestones are printed as
+# SCENE_COMPLETE and persisted in state.json for asynchronous monitoring.
 cd "$SOURCE_ROOT"
 BUILD_CONFIG="${BUILD_CONFIG:-$SOURCE_ROOT/scripts/rebuild_dataset/build_config.json}"
 if [[ "${EXECUTE_BUILD:-0}" != "1" ]]; then
   echo 'Plan only. EXECUTE_BUILD=1 is required for actual metadata/download/conversion.'
   exec "$PYTHON" -B -m scripts.rebuild_dataset.pipeline --config "$BUILD_CONFIG" --run-id "$RUN_ID"
 fi
+: "${T4D_SOURCE_SHA:?Set the committed source SHA recorded by server synchronization}"
 exec "$PYTHON" -u -B -m scripts.rebuild_dataset.pipeline --config "$BUILD_CONFIG" --run-id "$RUN_ID" --execute

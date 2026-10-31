@@ -186,6 +186,15 @@ class Downloader:
     def cleanup(self, records, *, validation_passed):
         if not validation_passed:
             raise ValueError("Cleanup requires successful V1 validation")
+        return self._remove_owned(records, {"kind": "full_v1_validation"})
+
+    def discard(self, records, *, reason):
+        """Only for explicitly classified local input defects, never network errors."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Discard requires an explicit permanent input-rejection reason")
+        return self._remove_owned(records, {"kind": "local_input_rejection", "reason": reason})
+
+    def _remove_owned(self, records, basis):
         for record in records:
             item = self.journal.get(record["path"])
             if not item or not item["owned"]:
@@ -207,6 +216,7 @@ class Downloader:
             if actual != item["actual"]:
                 raise ValueError("Input changed since validation")
             item["status"] = "delete_pending"
+            item["cleanup_basis"] = basis
             self.save()
             path.unlink()  # Enumerated, owned regular files only; no recursive deletion.
             item["status"] = "deleted"

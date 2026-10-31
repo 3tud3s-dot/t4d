@@ -218,21 +218,74 @@ def raw_inputs(entries, scene, revision):
     return chosen, streams
 
 
-def build_catalog(hub, revisions, selected=(), cache_dir=None):
+def parse_scene_ids(value):
+    """Explicit numbered selection; an empty or ambiguous selection never means all."""
+    if isinstance(value, str):
+        numbers = []
+        for token in value.split(","):
+            match = re.fullmatch(r"\s*(\d{1,3})(?:\s*-\s*(\d{1,3}))?\s*", token)
+            if not match:
+                raise ValueError("Use scene IDs such as 001-020 or 001,008,020")
+            start, end = int(match[1]), int(match[2] or match[1])
+            if not 1 <= start <= end <= 999:
+                raise ValueError("Scene IDs must be between 001 and 999, with ascending ranges")
+            numbers.extend(range(start, end + 1))
+    elif isinstance(value, list) and all(type(n) is int and 1 <= n <= 999 for n in value):
+        numbers = value
+    else:
+        raise ValueError("Scene IDs require a range string or integer list")
+    if not numbers or len(numbers) != len(set(numbers)):
+        raise ValueError("Scene IDs must be nonempty and distinct")
+    return sorted(numbers)
+
+
+def resolve_scene_ids(ids, published):
+    selected, missing = [], []
+    for number in parse_scene_ids(ids):
+        matches = sorted(n for n in published if n.startswith(f"{number:03d}-"))
+        if len(matches) > 1:
+            raise ValueError(f"Scene ID {number:03d} has multiple names: {matches}")
+        if matches:
+            selected.append(matches[0])
+        else:
+            missing.append({"scene_id": number, "reason": "scene_id_not_published"})
+    return selected, missing
+
+
+def build_catalog(hub, revisions, selected=(), cache_dir=None, *, scene_ids=None):
     raw_tree = hub.tree(REPOS["raw"], revisions["raw"], "raw")
     raw_scenes = {safe_name(e["path"].split("/")[1]) for e in raw_tree if e["type"] == "directory"}
-    if selected:
+    request_failures, selection_errors, published = {}, [], set()
+    if scene_ids is not None or selected:
         # A one-Episode smoke does not need every object's full file catalog.
         top = hub.tree(REPOS["processed"], revisions["processed"], "processed")
         published = {e["path"].split("/")[1] for e in top if e["type"] == "directory"}
+        if scene_ids is not None:
+            if selected:
+                raise ValueError("Choose either scene names or scene IDs, not both")
+            selected, selection_errors = resolve_scene_ids(scene_ids, raw_scenes | published)
         entries = []
         for scene in sorted(set(selected) & published):
-            entries.extend(hub.tree(REPOS["processed"], revisions["processed"], "processed/" + safe_name(scene), True))
+            cache = Path(cache_dir) / f"processed-{scene}.json" if cache_dir else None
+            if cache and cache.exists():
+                saved = json.loads(cache.read_text(encoding="utf-8"))
+                if saved["revision"] != revisions["processed"]:
+                    raise ValueError("Cached processed metadata revision mismatch")
+                page = saved["entries"]
+            else:
+                try:
+                    page = hub.tree(REPOS["processed"], revisions["processed"], "processed/" + safe_name(scene), True)
+                except (OSError, urllib.error.URLError) as exc:
+                    request_failures.setdefault(scene, []).append("processed_request_failed:" + type(exc).__name__)
+                    continue
+                if cache:
+                    save_json(cache, {"revision": revisions["processed"], "entries": page})
+            entries.extend(page)
         processed = index_processed(entries, revisions["processed"])
     else:
         processed = index_processed(hub.tree(REPOS["processed"], revisions["processed"], "processed", True), revisions["processed"])
-    requested = set(selected) if selected else raw_scenes | processed.keys()
-    if requested - (raw_scenes | processed.keys()):
+    requested = set(selected) if selected or scene_ids is not None else raw_scenes | processed.keys()
+    if requested - (raw_scenes | processed.keys() | published):
         raise ValueError("Requested scenes are absent from both repositories")
     result = []
     for scene in sorted(requested):
@@ -246,23 +299,44 @@ def build_catalog(hub, revisions, selected=(), cache_dir=None):
                     raise ValueError("Cached metadata revision mismatch")
                 raw_files, streams = saved["files"], saved["streams"]
             else:
-                raw_files, streams = raw_inputs(hub.tree(REPOS["raw"], revisions["raw"], "raw/" + scene, True), scene, revisions["raw"])
-                if cache:
+                try:
+                    page = hub.tree(REPOS["raw"], revisions["raw"], "raw/" + scene, True)
+                except (OSError, urllib.error.URLError) as exc:
+                    request_failures.setdefault(scene, []).append("raw_request_failed:" + type(exc).__name__)
+                    page = None
+                raw_files, streams = raw_inputs(page, scene, revisions["raw"]) if page is not None else ([], {})
+                if cache and page is not None:
                     save_json(cache, {"revision": revisions["raw"], "files": raw_files, "streams": streams})
         else:
             raw_files, streams = [], {}
         episodes = []
+        raw_reasons = []
+        if scene not in raw_scenes:
+            raw_reasons.append("raw_scene_missing")
+        elif scene not in request_failures:
+            for name, info in streams.items():
+                for key in ("recordings", "timestamps", "medians"):
+                    if not info[key]:
+                        raw_reasons.append(f"missing_tactile_resource:{name}:{key}")
         for number, info in sorted(processed.get(scene, {}).items()):
             missing = [n for n in REQUIRED if n not in info["files"] or info["files"][n]["size"] == 0]
-            reasons = (["raw_scene_missing"] if scene not in raw_scenes else [])
+            reasons = list(raw_reasons)
             reasons += ["missing_required_file:" + n for n in missing]
-            episodes.append({"episode": number, "directory": info["directory"], "download_ready": not reasons,
+            failures = request_failures.get(scene, [])
+            status = "request_failed" if failures else ("unavailable" if reasons else "candidate")
+            episodes.append({"episode": number, "directory": info["directory"], "download_ready": status == "candidate",
+                             "audit_status": status, "request_errors": failures,
                              "reasons": reasons, "files": [info["files"][n] for n in REQUIRED if n in info["files"]]})
+        scene_status = ("request_failed" if scene in request_failures else
+                        "candidate" if any(e["download_ready"] for e in episodes) else "unavailable")
         result.append({"scene": scene, "raw_files": raw_files, "streams": streams, "episodes": episodes,
+                       "audit_status": scene_status, "request_errors": request_failures.get(scene, []),
+                       "reasons": raw_reasons + (["no_processed_episodes"] if not episodes and scene not in request_failures else []),
                        "note": "Episode counts and multiple median candidates do not exclude downloads"})
     return {"schema": "t4d-build-catalog-v1", "revisions": revisions, "repos": REPOS,
             "network": getattr(hub, "network_info", {"endpoint": OFFICIAL_ENDPOINT, "proxy_mode": "offline_fixture"}),
             "created_utc": datetime.now(timezone.utc).isoformat(), "scenes": result,
+            "selection_errors": selection_errors,
             "content_verified": False}
 
 

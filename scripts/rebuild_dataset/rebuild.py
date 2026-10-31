@@ -29,6 +29,7 @@ All output NPZ files contain ordinary numeric/bool arrays, never pickle objects.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
@@ -51,7 +52,7 @@ DEPTH_VERSION = "touch4d-depth-v1"
 DEPTH_SCRIPT_VERSION = "1.0.0"
 SUPPORTED_SCRIPT_VERSIONS = ("1.1.0", "1.2.0", "1.3.0", SCRIPT_VERSION)
 # Reviewed physical identities, not an inference from episode number or R.
-# New scenes/episodes require a reviewed entry before reconstruction.
+# New scenes/episodes may instead use unambiguous documented source identities.
 SCENE_BINDINGS = {
     "001-rope": {
         0: ("right",), 1: ("right",), 2: ("right",), 3: ("right",), 4: ("right",),
@@ -90,6 +91,14 @@ SCENE_MEDIANS = {
 EXTERNAL_BINDING_EVIDENCE = {}
 
 
+class RulesPending(ValueError):
+    """Valid data may still lack an unambiguous physical-hand/baseline mapping."""
+
+
+class DataRejected(ValueError):
+    """A specific local input-format defect, before any output is constructed."""
+
+
 def load_scene_rules(path):
     """Add explicit per-scene choices; never infer hands or choose a first median."""
     if path is None:
@@ -105,6 +114,11 @@ def load_scene_rules(path):
         record = rules["evidence"].get(scene)
         require(isinstance(record, dict) and isinstance(record.get("method"), str)
                 and record["method"].strip(), "Binding choices require an evidence method")
+        per_episode = record.get("episode_evidence", {})
+        require(isinstance(per_episode, dict) and all(
+            isinstance(k, str) and re.fullmatch(r"0|[1-9]\d*", k)
+            and isinstance(v, dict) and isinstance(v.get("method"), str) and v["method"].strip()
+            for k, v in per_episode.items()), "Invalid per-Episode binding evidence")
         bindings[scene] = {}
         for ep, hands in episodes.items():
             require(isinstance(ep, str) and re.fullmatch(r"0|[1-9]\d*", ep), "Invalid Episode ID")
@@ -179,7 +193,8 @@ def hand_slots(scene, episode):
 def binding_evidence(scene, episode):
     hand_slots(scene, episode)
     if scene in EXTERNAL_BINDING_EVIDENCE:
-        return EXTERNAL_BINDING_EVIDENCE[scene]
+        record = EXTERNAL_BINDING_EVIDENCE[scene]
+        return record.get("episode_evidence", {}).get(str(episode), record)
     if scene == "051-cube":
         return {"camera": "brics-odroid-001_cam0",
                 "method": "episode-specific RGB and projected robot geometry review; no inferred identity",
@@ -552,6 +567,113 @@ def output_paths(source_root, output_root, scene, episode, *, allow_existing=Fal
         else:
             require(not path.exists(), f"Refusing existing/partial/backup output: {path}")
     return target, partial
+
+
+def resolve_episode_rules(source_root, scene, episode, configured, *, available_medians=None):
+    """Read documented slot identities, never infer them from R or Episode ID.
+
+    Accepted input fields explicitly describe *robot slots*: robot_slot_hands,
+    or physical_hand_to_robot_slot. A generic hand_order/bimanual flag is not
+    identity evidence. Unknown source schemas remain pending for later review.
+    This function does not mutate the legacy mapping tables or source tensors.
+    """
+    root = checked_path(source_root)
+    directories = discover_episodes(root / "processed" / scene)
+    if episode not in directories:
+        raise DataRejected("Selected source Episode directory is missing")
+    directory = directories[episode]
+    metadata_path, robot_path = directory / "metadata.json", directory / "robot/robot.npy"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        robot = np.load(io.BytesIO(robot_path.read_bytes()), allow_pickle=True)
+        if not isinstance(robot, np.ndarray) or robot.shape != ():
+            raise DataRejected("robot.npy must be a scalar dictionary container")
+        robot = robot.item()
+    except (ValueError, EOFError) as exc:
+        raise DataRejected("Invalid local metadata/robot container: " + str(exc)) from exc
+    if not isinstance(metadata, dict) or not isinstance(robot, dict):
+        raise DataRejected("Metadata and robot payloads must be dictionaries")
+    transforms = np.asarray(robot.get("T_worlds"))
+    if transforms.ndim == 3 and transforms.shape[1:] == (4, 4):
+        count = 1
+    elif transforms.ndim == 4 and transforms.shape[1] in (1, 2) and transforms.shape[2:] == (4, 4):
+        count = transforms.shape[1]
+    else:
+        raise DataRejected("Unsupported robot transform dimensions")
+    if not transforms.shape[0] or "openings" not in robot or "actions" not in robot:
+        raise DataRejected("Robot data has no frames or required opening/action fields")
+
+    candidates = []
+    for label, source in (("episode_metadata", metadata), ("robot_payload", robot)):
+        if "robot_slot_hands" in source:
+            hands = source["robot_slot_hands"]
+            if isinstance(hands, np.ndarray):
+                hands = hands.tolist()
+            candidates.append((label + ":robot_slot_hands", hands))
+        if "physical_hand_to_robot_slot" in source:
+            mapping = source["physical_hand_to_robot_slot"]
+            if not isinstance(mapping, dict) or set(mapping) - {"left", "right"}:
+                raise RulesPending("Invalid documented physical-hand mapping")
+            hands = [None] * count
+            for hand, slot in mapping.items():
+                if slot is None:
+                    continue
+                if (not isinstance(slot, (int, np.integer)) or isinstance(slot, (bool, np.bool_))
+                        or not 0 <= slot < count or hands[int(slot)] is not None):
+                    raise RulesPending("Ambiguous documented robot slot assignment")
+                hands[int(slot)] = hand
+            candidates.append((label + ":physical_hand_to_robot_slot", hands))
+    for label, hands in candidates:
+        if (not isinstance(hands, (list, tuple)) or len(hands) != count
+                or any(h not in HAND_ORDER for h in hands) or len(set(hands)) != count):
+            raise RulesPending("Invalid or incomplete documented slot identities: " + label)
+    configured_hands = configured["bindings"].get(scene, {}).get(str(episode))
+    reviewed_hands = SCENE_BINDINGS.get(scene, {}).get(episode)
+    known = configured_hands if configured_hands is not None else reviewed_hands
+    if known is not None:
+        if len(known) != count or any(list(hands) != list(known) for _, hands in candidates):
+            raise RulesPending("Documented robot identities conflict with existing scene rules")
+        hands = list(known)
+        method = "configured" if configured_hands is not None else "legacy_reviewed"
+    else:
+        if not candidates:
+            raise RulesPending("No documented robot-slot identities; generic hand_order and bimanual are insufficient")
+        hands = list(candidates[0][1])
+        if any(list(other) != hands for _, other in candidates):
+            raise RulesPending("Published slot identity fields disagree")
+        method = "documented_source_fields"
+
+    result = deepcopy(configured)
+    if known is None:
+        evidence = {"method": "documented physical robot-slot identities", "fields": [x[0] for x in candidates],
+                    "episode": episode, "metadata_sha256": hash_file(metadata_path),
+                    "robot_sha256": hash_file(robot_path)}
+        result["bindings"].setdefault(scene, {})[str(episode)] = hands
+        record = result["evidence"].setdefault(scene, {"method": "per-episode documented source identity"})
+        record.setdefault("episode_evidence", {})[str(episode)] = evidence
+
+    choices = result["medians"].get(scene, SCENE_MEDIANS.get(scene))
+    documented = metadata.get("tactile_baselines")
+    if documented is not None:
+        if (not isinstance(documented, dict) or set(documented) != set(STREAMS)
+                or any(not isinstance(n, str) or not re.fullmatch(r"median_\d+\.npy", n) for n in documented.values())):
+            raise RulesPending("Invalid documented tactile baseline names")
+        if choices is not None and documented != choices:
+            raise RulesPending("Documented baselines conflict with existing choices")
+        choices = documented
+        result["medians"][scene] = choices
+    for stream in STREAMS:
+        directory = root / "raw" / scene / ("brics-odroid_" + stream)
+        medians = ([p.name for p in directory.glob("median_*.npy")] if available_medians is None
+                   else available_medians.get(stream, []))
+        if not medians:
+            raise DataRejected("No baseline file for sensor " + stream)
+        if choices is None and len(medians) > 1:
+            raise RulesPending("Multiple baselines without a documented selection: " + stream)
+        if choices is not None and choices[stream] not in medians:
+            raise RulesPending("Chosen baseline is unavailable: " + stream)
+    return result, {"binding_method": method, "robot_slot_hands": hands,
+                    "baseline_method": "explicit" if choices is not None else "unique_available"}
 
 
 def preflight(source_root, output_root, scene, episodes):
@@ -1128,7 +1250,7 @@ def rebuild_episode(source_root, output_root, scene, episode, plan, *, overwrite
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scene", required=True, help="Full audited scene name")
-    parser.add_argument("--scene-rules", type=Path, help="Explicit hand/baseline choices with evidence")
+    parser.add_argument("--scene-rules", type=Path, help="Documented or reviewed hand/baseline choices with evidence")
     parser.add_argument("--source-root", type=Path, default=PROJECT / "datasets/deform360")
     parser.add_argument("--output-root", type=Path, default=PROJECT / "datasets/touch4d-v1")
     parser.add_argument("--depth-only", action="store_true",
@@ -1141,7 +1263,7 @@ def main(argv=None):
                         help="Rebuild selected episodes; replace existing outputs only after full validation")
     args = parser.parse_args(argv)
     load_scene_rules(args.scene_rules)
-    require(args.scene in SCENE_BINDINGS, "Scene requires explicit reviewed binding rules")
+    require(args.scene in SCENE_BINDINGS, "Scene requires documented or reviewed physical-hand binding rules")
     require(args.depth_only or args.depth_root is None, "--depth-root requires --depth-only")
     require(os.name != "nt", "Reconstruction outputs belong on the server; do not run on local Windows")
     if args.depth_only:

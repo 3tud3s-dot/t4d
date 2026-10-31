@@ -436,7 +436,7 @@ def main(argv=None):
     parser.add_argument("--structure-only", action="store_true", help="Skip original-file reads and source-value comparisons")
     args = parser.parse_args(argv)
     _rebuild.load_scene_rules(args.scene_rules)
-    require(args.scene in SCENE_BINDINGS, "Scene requires explicit reviewed binding rules")
+    require(args.scene in SCENE_BINDINGS, "Scene requires documented or reviewed physical-hand binding rules")
     require(args.depth_only or args.depth_root is None, "--depth-root requires --depth-only")
     if args.depth_only:
         return validate_depth_main(args)
