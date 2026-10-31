@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import hashlib
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import time
-import threading
 import urllib.parse
 
 try:
@@ -115,11 +113,6 @@ class Downloader:
     def __init__(self, root, journal_path, log_path, config):
         self.root, self.journal_path, self.log_path = Path(root), Path(journal_path), Path(log_path)
         self.config = config
-        self.concurrent_files = config.get("concurrent_files", 1)
-        if type(self.concurrent_files) is not int or not 1 <= self.concurrent_files <= 8:
-            raise ValueError("Concurrent files must be an integer between 1 and 8")
-        self._journal_lock = threading.RLock()
-        self._operation_lock = threading.RLock()
         self.endpoint = normalize_endpoint(config.get("endpoint", OFFICIAL_ENDPOINT))
         self.proxy = resolve_proxy(config["proxy"])
         self.network_info = {"endpoint": self.endpoint, "proxy_mode": "direct" if self.proxy is None else "explicit_proxy",
@@ -128,49 +121,7 @@ class Downloader:
         self.journal = json.loads(self.journal_path.read_text(encoding="utf-8")) if self.journal_path.exists() else {}
 
     def save(self):
-        with self._journal_lock:
-            save_json(self.journal_path, self.journal)
-
-    def fetch_many(self, records):
-        """One admitted Episode only; never prefetch additional Episodes.
-
-        Persist each file's ownership before starting its transfer. Stop scheduling
-        after a failure and join in-flight transfers before returning to cleanup
-        or recovery. A single journal writer prevents lost ownership records.
-        """
-        with self._operation_lock:
-            unique = {}
-            for record in records:
-                if record["path"] in unique and unique[record["path"]] != record:
-                    raise ValueError("Conflicting identities in download batch")
-                unique[record["path"]] = record
-            ordered = list(unique.values())
-            if self.concurrent_files == 1:
-                return [self._fetch(r) for r in ordered]
-            # Start long transfers early; small files can use remaining slots.
-            ordered.sort(key=lambda r: r["size"], reverse=True)
-            iterator = iter(ordered)
-            with ThreadPoolExecutor(max_workers=self.concurrent_files) as pool:
-                pending = {}
-                for _ in range(min(self.concurrent_files, len(ordered))):
-                    record = next(iterator)
-                    pending[pool.submit(self._fetch, record)] = record["path"]
-                paths = {}
-                while pending:
-                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
-                    try:
-                        # Observe all completed errors before scheduling more.
-                        for future in done:
-                            paths[pending.pop(future)] = future.result()
-                    except BaseException:
-                        for future in pending:
-                            future.cancel()
-                        raise
-                    for _ in done:
-                        record = next(iterator, None)
-                        if record is not None:
-                            pending[pool.submit(self._fetch, record)] = record["path"]
-            return [paths[r["path"]] for r in unique.values()]
+        save_json(self.journal_path, self.journal)
 
     def missing_bytes(self, records):
         # Deliberately conservative: do not assume a partial file is valid.
@@ -178,10 +129,6 @@ class Downloader:
                    or not bounded_path(self.root, r["path"]).is_file())
 
     def fetch(self, record):
-        with self._operation_lock:
-            return self._fetch(record)
-
-    def _fetch(self, record):
         path = bounded_path(self.root, record["path"])
         if record["repo"] not in REPOS.values() or not re.fullmatch(r"[0-9a-f]{40}", record["revision"]):
             raise ValueError("Unpinned or unknown download source")
@@ -190,10 +137,9 @@ class Downloader:
             raise ValueError("Input identity changed inside a run")
         if path.exists() and not previous:
             actual = verify_file(path, record)
-            with self._journal_lock:
-                self.journal[record["path"]] = {"record": record, "owned": False, "status": "verified", "actual": actual,
-                                                 "network": {"mode": "preexisting_file"}}
-                self.save()
+            self.journal[record["path"]] = {"record": record, "owned": False, "status": "verified", "actual": actual,
+                                             "network": {"mode": "preexisting_file"}}
+            self.save()
             return path
         if path.exists() and previous and previous["status"] == "verified":
             verify_file(path, record)
@@ -201,9 +147,8 @@ class Downloader:
         if not previous:
             if path.with_name(path.name + ".aria2").exists():
                 raise ValueError("Unowned partial download exists")
-            with self._journal_lock:
-                self.journal[record["path"]] = {"record": record, "owned": True, "status": "downloading", "network": self.network_info}
-                self.save()  # Persist ownership before creating the file.
+            self.journal[record["path"]] = {"record": record, "owned": True, "status": "downloading", "network": self.network_info}
+            self.save()  # Persist ownership before creating the file.
         elif previous["status"] in ("deleted", "delete_pending"):
             raise ValueError("Unexpected request for a previously cleaned input")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,9 +175,8 @@ class Downloader:
                 if path.with_name(path.name + ".aria2").exists():
                     raise ValueError("aria2 control file remains after reported completion")
                 actual = verify_file(path, record)
-                with self._journal_lock:
-                    self.journal[record["path"]].update(status="verified", actual=actual)
-                    self.save()
+                self.journal[record["path"]].update(status="verified", actual=actual)
+                self.save()
                 return path
             if result.returncode in (3, 9, 24) or attempt + 1 == self.config["attempts"]:
                 raise RuntimeError(f"aria2 failed: {record['path']}; exit={result.returncode}")
@@ -240,10 +184,6 @@ class Downloader:
         raise RuntimeError("Download failed")
 
     def cleanup(self, records, *, validation_passed):
-        with self._operation_lock:
-            return self._cleanup(records, validation_passed=validation_passed)
-
-    def _cleanup(self, records, *, validation_passed):
         if not validation_passed:
             raise ValueError("Cleanup requires successful V1 validation")
         for record in records:

@@ -7,8 +7,7 @@
   "download": {
     "endpoint": "https://hf-mirror.com",
     "proxy": null,
-    "attempts": 3,
-    "concurrent_files": 4
+    "attempts": 3
   },
   "space": {
     "quota_limit_gib": 1000,
