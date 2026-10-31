@@ -1,0 +1,16 @@
+{
+  "schema": "t4d-dataset-build-v1",
+  "source_root": "datasets/deform360-mirror-smoke",
+  "output_root": "datasets/touch4d-v1-mirror-smoke",
+  "runs_root": "runs/dataset_build",
+  "scenes": ["001-rope"],
+  "episodes": {"001-rope": [2]},
+  "download": {"endpoint": "https://hf-mirror.com", "proxy": null, "attempts": 3},
+  "space": {
+    "quota_limit_gib": 1000,
+    "reserve_gib": 20,
+    "output_to_splat_tar_multiplier": 1.0
+  },
+  "cleanup_verified_sources": true,
+  "scene_rules": {"bindings": {}, "medians": {}, "evidence": {}}
+}

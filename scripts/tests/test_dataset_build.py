@@ -7,6 +7,8 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 from scripts.rebuild_dataset import catalog as c, download as d, pipeline as p
@@ -25,6 +27,69 @@ def record(path="processed/001-rope/episode_0/splatfacto.tar", payload=b"test", 
 
 
 class CatalogTests(unittest.TestCase):
+    def test_pin_requests_revision_only_not_full_repository_file_list(self):
+        hub = c.Hub(endpoint=c.MIRROR_ENDPOINT)
+        with patch.object(hub, "get", return_value=({"sha": "a" * 40}, "")) as get:
+            self.assertEqual(hub.pin(c.REPOS["raw"]), "a" * 40)
+            self.assertIn("expand%5B%5D=sha", get.call_args.args[0])
+
+    def test_mirror_get_ignores_environment_proxy_and_uses_selected_endpoint(self):
+        real_builder = urllib.request.build_opener
+        with patch.dict(c.os.environ, {"HTTP_PROXY": "http://vpn.invalid:9", "HTTPS_PROXY": "http://vpn.invalid:9", "ALL_PROXY": "socks5://vpn.invalid:9"}), \
+                patch.object(c.urllib.request, "build_opener", side_effect=real_builder) as builder:
+            hub = c.Hub(endpoint=c.MIRROR_ENDPOINT, proxy=None)
+            self.assertEqual(builder.call_args.args[0].proxies, {})
+        response = io.BytesIO(b'{"sha":"fixture"}')
+        response.headers = {}
+        with patch.object(hub.opener, "open", return_value=response) as opened, \
+                patch.object(c.urllib.request, "urlopen", side_effect=AssertionError("global opener forbidden")):
+            self.assertEqual(hub.get(c.OFFICIAL_ENDPOINT + "/api/datasets/brownu/deform360")[0], {"sha": "fixture"})
+            self.assertEqual(opened.call_args[0][0].full_url, c.MIRROR_ENDPOINT + "/api/datasets/brownu/deform360")
+        self.assertEqual(hub.network_info["proxy_mode"], "direct")
+        self.assertFalse(hub.network_info["proxy_fallback"])
+
+    def test_official_pagination_link_stays_on_mirror(self):
+        hub = c.Hub(endpoint=c.MIRROR_ENDPOINT)
+        next_url = c.OFFICIAL_ENDPOINT + "/api/datasets/r/tree/sha/raw?cursor=next"
+        with patch.object(hub, "get", side_effect=[([entry("raw/a")], f'<{next_url}>; rel="next"'), ([entry("raw/b")], "")]) as get:
+            self.assertEqual(len(hub.tree("r", "sha", "raw")), 2)
+            self.assertTrue(get.call_args_list[1].args[0].startswith(c.MIRROR_ENDPOINT + "/api/"))
+
+    def test_metadata_redirect_cannot_downgrade_or_escape(self):
+        redirect = c.MetadataRedirect(c.MIRROR_ENDPOINT)
+        request = urllib.request.Request(c.MIRROR_ENDPOINT + "/api/datasets/r")
+        redirected = redirect.redirect_request(request, None, 302, "Found", {}, c.OFFICIAL_ENDPOINT + "/api/datasets/r?cursor=next")
+        self.assertTrue(redirected.full_url.startswith(c.MIRROR_ENDPOINT))
+        for url in ("http://hf-mirror.com/api/datasets/r", "https://evil.invalid/api/datasets/r", c.MIRROR_ENDPOINT + "/datasets/r/file.tar"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                redirect.redirect_request(request, None, 302, "Found", {}, url)
+
+    def test_mirror_403_retry_is_bounded_and_does_not_fallback(self):
+        hub = c.Hub(attempts=2, endpoint=c.MIRROR_ENDPOINT, proxy=None)
+        denied = urllib.error.HTTPError(c.MIRROR_ENDPOINT + "/api/datasets/r", 403, "Forbidden", {}, None)
+        with patch.object(hub.opener, "open", side_effect=denied) as opened, patch.object(c.time, "sleep"):
+            with self.assertRaises(urllib.error.HTTPError):
+                hub.get(c.OFFICIAL_ENDPOINT + "/api/datasets/r")
+            self.assertEqual(opened.call_count, 2)
+            self.assertTrue(all(x.args[0].full_url.startswith(c.MIRROR_ENDPOINT) for x in opened.call_args_list))
+
+    def test_selected_scene_catalog_does_not_query_other_object_payloads(self):
+        calls = []
+        class FakeHub:
+            def tree(self, repo, rev, path, recursive=False):
+                calls.append((path, recursive))
+                if path in ("raw", "processed"):
+                    return [{"type": "directory", "path": path + "/001-rope"}, {"type": "directory", "path": path + "/other"}]
+                if path == "processed/001-rope":
+                    return [entry("processed/001-rope/episode_2/" + n) for n in c.REQUIRED]
+                if path == "raw/001-rope":
+                    return []
+                raise AssertionError("Unexpected scene query")
+        data = c.build_catalog(FakeHub(), {"raw": "a" * 40, "processed": "b" * 40}, ["001-rope"])
+        self.assertEqual(data["scenes"][0]["episodes"][0]["episode"], 2)
+        self.assertNotIn(("processed", True), calls)
+        self.assertFalse(any("/other" in path for path, _ in calls))
+
     def test_partial_episode_set_is_kept(self):
         files = [entry("processed/001-rope/episode_7/" + name) for name in c.REQUIRED]
         raw = [entry(f"raw/001-rope/brics-odroid_{s}/{name}") for s in c.STREAMS
@@ -108,6 +173,34 @@ class DownloadTests(unittest.TestCase):
         path.write_bytes(b"bad!")
         with self.assertRaises(ValueError):
             d.verify_file(path, record())
+
+    def test_mirror_download_disables_all_proxy_inheritance_and_aria_config(self):
+        rec = record(lfs=True)
+        config = {"endpoint": c.MIRROR_ENDPOINT, "proxy": None, "attempts": 2}
+        loader = d.Downloader(self.root, self.root / "mirror-ledger.json", self.root / "mirror-download.log", config)
+        def download(args, **kwargs):
+            self.assertIn("--no-conf=true", args)
+            self.assertIn("--all-proxy=", args)
+            self.assertTrue(args[-1].startswith(c.MIRROR_ENDPOINT + "/datasets/"))
+            self.assertFalse(any(k.lower() in ("http_proxy", "https_proxy", "all_proxy") for k in kwargs["env"]))
+            (self.root / rec["path"]).write_bytes(b"test")
+            return SimpleNamespace(returncode=0)
+        with patch.dict(d.os.environ, {"http_proxy": "http://vpn.invalid:9", "HTTPS_PROXY": "http://vpn.invalid:9", "all_proxy": "socks5://vpn.invalid:9"}), \
+                patch.object(d.subprocess, "run", side_effect=download):
+            loader.fetch(rec)
+        network = loader.journal[rec["path"]]["network"]
+        self.assertEqual(network["proxy_mode"], "direct")
+        self.assertFalse(network["proxy_fallback"])
+        self.assertTrue(network["aria2_config_disabled"])
+
+    def test_mirror_download_failure_never_tries_vpn_or_official_endpoint(self):
+        loader = d.Downloader(self.root, self.root / "mirror-ledger.json", self.root / "mirror-download.log",
+                              {"endpoint": c.MIRROR_ENDPOINT, "proxy": None, "attempts": 2})
+        with patch.object(d.subprocess, "run", return_value=SimpleNamespace(returncode=6)) as run, patch.object(d.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                loader.fetch(record())
+            self.assertEqual(run.call_count, 2)
+            self.assertTrue(all(x.args[0][-1].startswith(c.MIRROR_ENDPOINT) and "--all-proxy=" in x.args[0] for x in run.call_args_list))
 
     def test_quota_includes_conversion_and_reserve(self):
         self.assertEqual(d.check_space(300, 100, 100, 20), 270)
@@ -232,6 +325,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(config["episodes"], {"001-rope": [0]})
         self.assertNotEqual(roots["source_root"], p.PROJECT / "datasets/deform360")
         self.assertNotEqual(roots["output_root"], p.PROJECT / "datasets/touch4d-v1")
+
+    def test_mirror_config_is_ep2_direct_and_isolated(self):
+        config, roots = p.load_config(p.HERE / "mirror_smoke_config.json")
+        self.assertEqual(config["episodes"], {"001-rope": [2]})
+        self.assertEqual(config["download"]["endpoint"], c.MIRROR_ENDPOINT)
+        self.assertIsNone(config["download"]["proxy"])
+        self.assertNotEqual(roots["source_root"], p.PROJECT / "datasets/deform360-smoke")
+        self.assertNotEqual(roots["output_root"], p.PROJECT / "datasets/touch4d-v1-smoke")
+
+    def test_invalid_mirror_or_credentials_rejected(self):
+        for endpoint in ("http://hf-mirror.com", "https://hf-mirror.com.evil.invalid", "https://user:secret@hf-mirror.com", "https://hf-mirror.com/path"):
+            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                c.normalize_endpoint(endpoint)
 
     def test_batch_entry_explicitly_requests_no_gpu(self):
         self.assertIn("#SBATCH --gres=none", (p.HERE / "build.sbatch").read_text())

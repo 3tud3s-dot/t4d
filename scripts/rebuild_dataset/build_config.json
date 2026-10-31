@@ -5,7 +5,8 @@
   "runs_root": "runs/dataset_build",
   "scenes": [],
   "download": {
-    "proxy": "auto",
+    "endpoint": "https://hf-mirror.com",
+    "proxy": null,
     "attempts": 3
   },
   "space": {

@@ -14,8 +14,53 @@ import urllib.parse
 import urllib.request
 
 REPOS = {"raw": "brownu/deform360", "processed": "brownu/deform360_processed"}
+OFFICIAL_ENDPOINT = "https://huggingface.co"
+MIRROR_ENDPOINT = "https://hf-mirror.com"
 STREAMS = ("tactilel_left", "tactilel_right", "tactiler_left", "tactiler_right")
 REQUIRED = ("metadata.json", "cameras.tar", "splatfacto.tar", "robot/robot.npy")
+
+
+def normalize_endpoint(endpoint):
+    if not isinstance(endpoint, str):
+        raise ValueError("Hub endpoint must be a URL")
+    endpoint = endpoint.rstrip("/")
+    if endpoint not in (OFFICIAL_ENDPOINT, MIRROR_ENDPOINT):
+        raise ValueError("Choose the official Hub or the explicitly supported HTTPS mirror")
+    return endpoint
+
+
+def resolve_proxy(proxy):
+    if proxy == "auto":
+        proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+        if not proxy:
+            raise RuntimeError("Explicit proxy requested but unavailable; use proxy=null for direct access")
+    if proxy is not None:
+        if not isinstance(proxy, str):
+            raise ValueError("Invalid proxy")
+        parsed = urllib.parse.urlsplit(proxy)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None:
+            raise ValueError("Use an HTTP/HTTPS proxy without embedded credentials")
+    return proxy
+
+
+def route_api_url(url, endpoint):
+    endpoint = normalize_endpoint(endpoint)
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme != "https" or parsed.netloc not in ("huggingface.co", "hf-mirror.com")
+            or not parsed.path.startswith("/api/datasets/") or parsed.fragment):
+        raise ValueError("Only Hub dataset metadata API URLs are accepted")
+    # Official pagination links returned by the mirror remain on the selected
+    # endpoint. This is a host substitution, never a proxy/official fallback.
+    return endpoint + parsed.path + ("?" + parsed.query if parsed.query else "")
+
+
+class MetadataRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, endpoint):
+        self.endpoint = endpoint
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = route_api_url(urllib.parse.urljoin(req.full_url, newurl), self.endpoint)
+        return super().redirect_request(req, fp, code, msg, headers, target)
 
 
 def safe_name(value):
@@ -58,20 +103,24 @@ def save_json(path, value):
 
 
 class Hub:
-    def __init__(self, timeout=30, attempts=3):
+    def __init__(self, timeout=30, attempts=3, *, endpoint=OFFICIAL_ENDPOINT, proxy=None):
         self.timeout, self.attempts = timeout, attempts
+        self.endpoint = normalize_endpoint(endpoint)
+        self.proxy = resolve_proxy(proxy)
+        proxies = {} if self.proxy is None else {"http": self.proxy, "https": self.proxy}
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), MetadataRedirect(self.endpoint))
+        self.network_info = {"endpoint": self.endpoint, "proxy_mode": "direct" if self.proxy is None else "explicit_proxy",
+                             "proxy_fallback": False, "tls_verification": True}
 
     def get(self, url):
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme != "https" or parsed.netloc != "huggingface.co" or not parsed.path.startswith("/api/datasets/"):
-            raise ValueError("Only official dataset metadata API URLs are accepted")
+        url = route_api_url(url, self.endpoint)
         for attempt in range(self.attempts):
             try:
                 request = urllib.request.Request(url, headers={"User-Agent": "t4d-dataset-build/1"})
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with self.opener.open(request, timeout=self.timeout) as response:
                     return json.load(response), response.headers.get("Link", "")
             except urllib.error.HTTPError as exc:
-                if exc.code not in (408, 429, 500, 502, 503, 504) or attempt + 1 == self.attempts:
+                if exc.code not in (403, 408, 429, 500, 502, 503, 504) or attempt + 1 == self.attempts:
                     raise
             except (OSError, ValueError):
                 if attempt + 1 == self.attempts:
@@ -80,7 +129,8 @@ class Hub:
         raise RuntimeError("Request failed")
 
     def pin(self, repo):
-        data, _ = self.get("https://huggingface.co/api/datasets/" + repo)
+        query = urllib.parse.urlencode({"expand[]": "sha"})
+        data, _ = self.get("https://huggingface.co/api/datasets/" + repo + "?" + query)
         sha = data.get("sha", "")
         if not re.fullmatch(r"[0-9a-f]{40}", sha):
             raise ValueError("Missing immutable repository revision")
@@ -90,6 +140,7 @@ class Hub:
         url = f"https://huggingface.co/api/datasets/{repo}/tree/{revision}/{path}?limit=1000"
         if recursive:
             url += "&recursive=true"
+        url = route_api_url(url, self.endpoint)
         seen_urls, seen_paths, entries = set(), set(), []
         while url:
             if url in seen_urls:
@@ -111,7 +162,7 @@ class Hub:
             next_links = re.findall(r'<([^>]+)>;\s*rel="next"', links)
             if len(next_links) > 1:
                 raise ValueError("Ambiguous pagination")
-            url = next_links[0] if next_links else None
+            url = route_api_url(urllib.parse.urljoin(url, next_links[0]), self.endpoint) if next_links else None
         return entries
 
 
@@ -170,7 +221,16 @@ def raw_inputs(entries, scene, revision):
 def build_catalog(hub, revisions, selected=(), cache_dir=None):
     raw_tree = hub.tree(REPOS["raw"], revisions["raw"], "raw")
     raw_scenes = {safe_name(e["path"].split("/")[1]) for e in raw_tree if e["type"] == "directory"}
-    processed = index_processed(hub.tree(REPOS["processed"], revisions["processed"], "processed", True), revisions["processed"])
+    if selected:
+        # A one-Episode smoke does not need every object's full file catalog.
+        top = hub.tree(REPOS["processed"], revisions["processed"], "processed")
+        published = {e["path"].split("/")[1] for e in top if e["type"] == "directory"}
+        entries = []
+        for scene in sorted(set(selected) & published):
+            entries.extend(hub.tree(REPOS["processed"], revisions["processed"], "processed/" + safe_name(scene), True))
+        processed = index_processed(entries, revisions["processed"])
+    else:
+        processed = index_processed(hub.tree(REPOS["processed"], revisions["processed"], "processed", True), revisions["processed"])
     requested = set(selected) if selected else raw_scenes | processed.keys()
     if requested - (raw_scenes | processed.keys()):
         raise ValueError("Requested scenes are absent from both repositories")
@@ -201,6 +261,7 @@ def build_catalog(hub, revisions, selected=(), cache_dir=None):
         result.append({"scene": scene, "raw_files": raw_files, "streams": streams, "episodes": episodes,
                        "note": "Episode counts and multiple median candidates do not exclude downloads"})
     return {"schema": "t4d-build-catalog-v1", "revisions": revisions, "repos": REPOS,
+            "network": getattr(hub, "network_info", {"endpoint": OFFICIAL_ENDPOINT, "proxy_mode": "offline_fixture"}),
             "created_utc": datetime.now(timezone.utc).isoformat(), "scenes": result,
             "content_verified": False}
 
@@ -209,10 +270,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--scenes", nargs="*", default=[])
+    p.add_argument("--endpoint", default=MIRROR_ENDPOINT, choices=(OFFICIAL_ENDPOINT, MIRROR_ENDPOINT))
+    p.add_argument("--proxy", default=None, help="Explicit proxy only; default is direct, ignoring environment proxies")
     args = p.parse_args()
     if args.output.exists():
         p.error("Refusing to overwrite an existing catalog")
-    hub = Hub()
+    hub = Hub(endpoint=args.endpoint, proxy=args.proxy)
     revisions = {k: hub.pin(repo) for k, repo in REPOS.items()}
     catalog = build_catalog(hub, revisions, args.scenes)
     args.output.parent.mkdir(parents=True, exist_ok=True)

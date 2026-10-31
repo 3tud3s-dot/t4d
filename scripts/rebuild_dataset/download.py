@@ -11,9 +11,9 @@ import time
 import urllib.parse
 
 try:
-    from .catalog import REPOS, safe_relative, save_json
+    from .catalog import REPOS, OFFICIAL_ENDPOINT, normalize_endpoint, resolve_proxy, safe_relative, save_json
 except ImportError:
-    from catalog import REPOS, safe_relative, save_json
+    from catalog import REPOS, OFFICIAL_ENDPOINT, normalize_endpoint, resolve_proxy, safe_relative, save_json
 
 
 class SpaceBlocked(RuntimeError):
@@ -113,6 +113,10 @@ class Downloader:
     def __init__(self, root, journal_path, log_path, config):
         self.root, self.journal_path, self.log_path = Path(root), Path(journal_path), Path(log_path)
         self.config = config
+        self.endpoint = normalize_endpoint(config.get("endpoint", OFFICIAL_ENDPOINT))
+        self.proxy = resolve_proxy(config["proxy"])
+        self.network_info = {"endpoint": self.endpoint, "proxy_mode": "direct" if self.proxy is None else "explicit_proxy",
+                             "proxy_fallback": False, "aria2_config_disabled": True}
         import json
         self.journal = json.loads(self.journal_path.read_text(encoding="utf-8")) if self.journal_path.exists() else {}
 
@@ -133,7 +137,8 @@ class Downloader:
             raise ValueError("Input identity changed inside a run")
         if path.exists() and not previous:
             actual = verify_file(path, record)
-            self.journal[record["path"]] = {"record": record, "owned": False, "status": "verified", "actual": actual}
+            self.journal[record["path"]] = {"record": record, "owned": False, "status": "verified", "actual": actual,
+                                             "network": {"mode": "preexisting_file"}}
             self.save()
             return path
         if path.exists() and previous and previous["status"] == "verified":
@@ -142,21 +147,13 @@ class Downloader:
         if not previous:
             if path.with_name(path.name + ".aria2").exists():
                 raise ValueError("Unowned partial download exists")
-            self.journal[record["path"]] = {"record": record, "owned": True, "status": "downloading"}
+            self.journal[record["path"]] = {"record": record, "owned": True, "status": "downloading", "network": self.network_info}
             self.save()  # Persist ownership before creating the file.
         elif previous["status"] in ("deleted", "delete_pending"):
             raise ValueError("Unexpected request for a previously cleaned input")
         path.parent.mkdir(parents=True, exist_ok=True)
-        proxy = self.config["proxy"]
-        if proxy == "auto":
-            proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
-            if not proxy:
-                raise RuntimeError("Set an explicit reachable proxy or choose proxy=null for direct access")
-        if proxy is not None and urllib.parse.urlsplit(proxy).scheme not in ("http", "https"):
-            raise ValueError("aria2 HTTP/HTTPS proxy required")
-        if proxy and urllib.parse.urlsplit(proxy).username is not None:
-            raise ValueError("Do not place proxy credentials in commands or run logs")
-        args = ["aria2c", "--continue=true", "--check-integrity=true", "--auto-file-renaming=false",
+        proxy = self.proxy
+        args = ["aria2c", "--no-conf=true", "--continue=true", "--check-integrity=true", "--auto-file-renaming=false",
                 "--allow-overwrite=false", "--max-tries=1", "--retry-wait=3", "--connect-timeout=30",
                 "--timeout=60", "--file-allocation=none", "--max-connection-per-server=8", "--split=8",
                 "--min-split-size=5M", "--summary-interval=30", "--console-log-level=notice",
@@ -164,13 +161,14 @@ class Downloader:
         args.append("--all-proxy=" + (proxy or ""))
         if record.get("sha256"):
             args.append("--checksum=sha-256=" + record["sha256"])
-        args.append(f"https://huggingface.co/datasets/{record['repo']}/resolve/{record['revision']}/"
+        args.append(f"{self.endpoint}/datasets/{record['repo']}/resolve/{record['revision']}/"
                     + urllib.parse.quote(record["path"], safe="/"))
         env = {k: v for k, v in os.environ.items() if k.lower() not in ("all_proxy", "http_proxy", "https_proxy")}
         env["HF_HUB_DISABLE_XET"] = "1"
         for attempt in range(self.config["attempts"]):
             with self.log_path.open("a", encoding="utf-8") as log:
                 log.write(f"\nDownload {record['path']} attempt {attempt + 1}\n")
+                log.write("Network policy: " + str(self.network_info) + "\n")
                 log.flush()
                 result = subprocess.run(args, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
             if result.returncode == 0:

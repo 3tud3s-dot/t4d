@@ -21,10 +21,10 @@ import subprocess
 import sys
 
 try:
-    from .catalog import Hub, REPOS, build_catalog, safe_name, save_json
+    from .catalog import Hub, REPOS, OFFICIAL_ENDPOINT, normalize_endpoint, build_catalog, safe_name, save_json
     from .download import Downloader, SpaceBlocked, bounded_path, check_space, available_bytes
 except ImportError:
-    from catalog import Hub, REPOS, build_catalog, safe_name, save_json
+    from catalog import Hub, REPOS, OFFICIAL_ENDPOINT, normalize_endpoint, build_catalog, safe_name, save_json
     from download import Downloader, SpaceBlocked, bounded_path, check_space, available_bytes
 
 PROJECT = Path(__file__).resolve().parents[2]
@@ -66,8 +66,9 @@ def load_config(path, project=PROJECT):
                 or len(episodes) != len(set(episodes))):
             raise ValueError("Select distinct nonnegative Episode IDs")
     d, s = config["download"], config["space"]
-    if set(d) != {"proxy", "attempts"} or type(d["attempts"]) is not int or not 1 <= d["attempts"] <= 10:
+    if set(d) not in ({"proxy", "attempts"}, {"endpoint", "proxy", "attempts"}) or type(d["attempts"]) is not int or not 1 <= d["attempts"] <= 10:
         raise ValueError("Invalid bounded download retry configuration")
+    normalize_endpoint(d.get("endpoint", OFFICIAL_ENDPOINT))
     if d["proxy"] is not None and not isinstance(d["proxy"], str):
         raise ValueError("Invalid proxy")
     if isinstance(d["proxy"], str) and "@" in d["proxy"]:
@@ -256,7 +257,8 @@ def execute_locked(config, roots, run):
     except ImportError:
         import rebuild
     rebuild.load_scene_rules(rules)
-    hub = Hub()
+    hub = Hub(endpoint=config["download"].get("endpoint", OFFICIAL_ENDPOINT), proxy=config["download"]["proxy"])
+    print("Network policy:", json.dumps(hub.network_info), flush=True)
     pins = run / "revisions.json"
     if pins.exists():
         revisions = json.loads(pins.read_text(encoding="utf-8"))
@@ -276,6 +278,7 @@ def execute_locked(config, roots, run):
     if not provenance_path.exists():
         save_json(provenance_path, {"code_sha256": identity, "manifest_sha256": digest(manifest),
                   "source_commit": os.environ.get("T4D_SOURCE_SHA"),
+                  "network": hub.network_info,
                   "config_sha256": digest(snapshot), "python": sys.version,
                   "slurm_job_id": os.environ.get("SLURM_JOB_ID"), "slurm_step_id": os.environ.get("SLURM_STEP_ID"),
                   "started_utc": datetime.now(timezone.utc).isoformat()})
@@ -338,6 +341,9 @@ def main(argv=None):
             print(json.dumps({"mode": "plan_only", "run": str(roots["runs_root"] / args.run_id),
                               "paths": {k: str(v) for k, v in roots.items()}, "scenes": config["scenes"] or "all published scenes",
                               "explicit_episode_selection": config.get("episodes", {}),
+                              "endpoint": config["download"].get("endpoint", OFFICIAL_ENDPOINT),
+                              "proxy_mode": "direct" if config["download"]["proxy"] is None else "explicit_proxy",
+                              "automatic_proxy_fallback": False,
                               "episode_count_filter": False, "multiple_median_filter": False,
                               "network_queries": False, "downloads": False, "conversion": False, "cleanup": False}, indent=2))
             return 0
