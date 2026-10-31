@@ -1,0 +1,15 @@
+# Server datasets and generated run artifacts are not source code.
+/datasets/
+/runs/
+/artifacts/
+
+# Local environments and Python caches.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Heavy training artifacts never belong in this repository.
+*.pt
+*.pth
+*.ckpt

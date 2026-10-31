@@ -1,0 +1,16 @@
+{
+  "schema": "t4d-dataset-build-v1",
+  "source_root": "datasets/deform360-smoke",
+  "output_root": "datasets/touch4d-v1-smoke",
+  "runs_root": "runs/dataset_build",
+  "scenes": ["001-rope"],
+  "episodes": {"001-rope": [0]},
+  "download": {"proxy": "http://127.0.0.1:17891", "attempts": 3},
+  "space": {
+    "quota_limit_gib": 1000,
+    "reserve_gib": 20,
+    "output_to_splat_tar_multiplier": 1.0
+  },
+  "cleanup_verified_sources": true,
+  "scene_rules": {"bindings": {}, "medians": {}, "evidence": {}}
+}

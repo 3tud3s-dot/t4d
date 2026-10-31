@@ -424,7 +424,8 @@ def validate_depth_main(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scene", required=True, choices=sorted(SCENE_BINDINGS), help="Full audited scene name")
+    parser.add_argument("--scene", required=True, help="Full audited scene name")
+    parser.add_argument("--scene-rules", type=Path, help="Same explicit choices used for reconstruction")
     parser.add_argument("--data-root", type=Path, default=PROJECT / "datasets/touch4d-v1")
     parser.add_argument("--depth-only", action="store_true", help="Validate only the isolated depth extension")
     parser.add_argument("--depth-root", type=Path,
@@ -434,6 +435,8 @@ def main(argv=None):
                         help="Optional subset; default: all scene episodes")
     parser.add_argument("--structure-only", action="store_true", help="Skip original-file reads and source-value comparisons")
     args = parser.parse_args(argv)
+    _rebuild.load_scene_rules(args.scene_rules)
+    require(args.scene in SCENE_BINDINGS, "Scene requires explicit reviewed binding rules")
     require(args.depth_only or args.depth_root is None, "--depth-root requires --depth-only")
     if args.depth_only:
         return validate_depth_main(args)

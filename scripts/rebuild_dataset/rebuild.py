@@ -87,6 +87,42 @@ SCENE_MEDIANS = {
         "tactiler_right": "median_1769464491904483.npy",
     },
 }
+EXTERNAL_BINDING_EVIDENCE = {}
+
+
+def load_scene_rules(path):
+    """Add explicit per-scene choices; never infer hands or choose a first median."""
+    if path is None:
+        return
+    rules = json.loads(Path(path).read_text(encoding="utf-8"))
+    require(isinstance(rules, dict) and set(rules) == {"bindings", "medians", "evidence"},
+            "Scene rules require bindings, medians and evidence dictionaries")
+    require(all(isinstance(rules[k], dict) for k in rules), "Invalid scene rule dictionaries")
+    bindings, medians, evidence = {}, {}, {}
+    for scene, episodes in rules["bindings"].items():
+        require(isinstance(scene, str) and re.fullmatch(r"[A-Za-z0-9_-]+", scene), "Invalid scene name")
+        require(isinstance(episodes, dict) and episodes, "Bindings must list explicit episodes")
+        record = rules["evidence"].get(scene)
+        require(isinstance(record, dict) and isinstance(record.get("method"), str)
+                and record["method"].strip(), "Binding choices require an evidence method")
+        bindings[scene] = {}
+        for ep, hands in episodes.items():
+            require(isinstance(ep, str) and re.fullmatch(r"0|[1-9]\d*", ep), "Invalid Episode ID")
+            require(isinstance(hands, list) and 1 <= len(hands) <= 2
+                    and all(h in ("left", "right") for h in hands) and len(hands) == len(set(hands)),
+                    "Bindings must explicitly identify one or two distinct physical hands")
+            bindings[scene][int(ep)] = tuple(hands)
+        evidence[scene] = record
+    for scene, choices in rules["medians"].items():
+        require(scene in bindings or scene in SCENE_BINDINGS, "Median scene has no binding rules")
+        require(isinstance(choices, dict) and set(choices) == set(STREAMS), "Specify all four sensor baselines")
+        require(all(isinstance(n, str) and re.fullmatch(r"median_\d+\.npy", n) for n in choices.values()),
+                "Invalid median filename")
+        medians[scene] = choices
+    for scene, episodes in bindings.items():
+        SCENE_BINDINGS.setdefault(scene, {}).update(episodes)
+    SCENE_MEDIANS.update(medians)
+    EXTERNAL_BINDING_EVIDENCE.update(evidence)
 PINK_REVIEW_FRAMES = {
     0: [113, 163, 213], 1: [113, 238, 364], 2: [103, 185, 268],
     3: [97, 264, 432], 4: [101, 243, 385], 5: [88, 212, 336],
@@ -142,6 +178,8 @@ def hand_slots(scene, episode):
 
 def binding_evidence(scene, episode):
     hand_slots(scene, episode)
+    if scene in EXTERNAL_BINDING_EVIDENCE:
+        return EXTERNAL_BINDING_EVIDENCE[scene]
     if scene == "051-cube":
         return {"camera": "brics-odroid-001_cam0",
                 "method": "episode-specific RGB and projected robot geometry review; no inferred identity",
@@ -1089,7 +1127,8 @@ def rebuild_episode(source_root, output_root, scene, episode, plan, *, overwrite
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scene", required=True, choices=sorted(SCENE_BINDINGS), help="Full audited scene name")
+    parser.add_argument("--scene", required=True, help="Full audited scene name")
+    parser.add_argument("--scene-rules", type=Path, help="Explicit hand/baseline choices with evidence")
     parser.add_argument("--source-root", type=Path, default=PROJECT / "datasets/deform360")
     parser.add_argument("--output-root", type=Path, default=PROJECT / "datasets/touch4d-v1")
     parser.add_argument("--depth-only", action="store_true",
@@ -1101,6 +1140,8 @@ def main(argv=None):
     parser.add_argument("--overwrite", action="store_true",
                         help="Rebuild selected episodes; replace existing outputs only after full validation")
     args = parser.parse_args(argv)
+    load_scene_rules(args.scene_rules)
+    require(args.scene in SCENE_BINDINGS, "Scene requires explicit reviewed binding rules")
     require(args.depth_only or args.depth_root is None, "--depth-root requires --depth-only")
     require(os.name != "nt", "Reconstruction outputs belong on the server; do not run on local Windows")
     if args.depth_only:
